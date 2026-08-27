@@ -1,0 +1,13 @@
+{
+  "name": "rn-freegamehost-renew",
+  "version": "1.0.0",
+  "description": "FreeGameHost 自动续期（puppeteer-real-browser 过 CF Turnstile）",
+  "main": "renew-freegamehost.js",
+  "scripts": {
+    "start": "node renew-freegamehost.js",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "puppeteer-real-browser": "^1.4.4"
+  }
+}
