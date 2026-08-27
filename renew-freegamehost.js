@@ -26,8 +26,8 @@ const { connect } = require('puppeteer-real-browser');
 
 const EMAIL = process.env.EMAIL || '';
 const PASSWORD = process.env.PASSWORD || '';
-const SERVER_ID = (process.env.SERVER_ID || '09758a67').trim();
-const IS_PROXY = (process.env.IS_PROXY || 'false').toLowerCase() === 'true';
+const SERVER_ID = (process.env.SERVER_ID || '63e3022e').trim();
+const IS_PROXY = (process.env.IS_PROXY || 'true').toLowerCase() === 'true';
 const PROXY_SERVER = (process.env.PROXY_SERVER || '').trim() || 'socks5://127.0.0.1:1080';
 const SESSION_COOKIES = (process.env.SESSION_COOKIES || '').trim();
 const TG_BOT_TOKEN = process.env.TG_BOT_TOKEN || '';
