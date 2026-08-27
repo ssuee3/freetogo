@@ -1,0 +1,83 @@
+# FreeGameHost 自动续期工作流
+name: Auto Renew FreeGameHost
+
+on:
+  workflow_dispatch:
+  schedule:
+    # 每 3 小时（UTC 整点：0/3/6/9/12/15/18/21，北京时间 8/11/14/17/20/23/2/5）
+    - cron: '0 */3 * * *'
+
+jobs:
+  renew-freegamehost:
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Setup Chrome & Xvfb
+        run: |
+          google-chrome --version || (sudo apt-get update && sudo apt-get install -y google-chrome-stable)
+          sudo apt-get install -y xvfb
+
+      - name: ⚙ 设置代理 (sing-box)
+        continue-on-error: true
+        env:
+          NODE_LINK: ${{ secrets.NODE_LINK }}
+        run: |
+          bash <(wget -qO- https://main.ssss.nyc.mn/setup_proxy.sh)
+
+      - name: Run renewal script
+        env:
+          EMAIL: ${{ secrets.EMAIL }}
+          PASSWORD: ${{ secrets.PASSWORD }}
+          SESSION_COOKIES: ${{ secrets.SESSION_COOKIES }}
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+        run: |
+          xvfb-run -a node renew-freegamehost.js
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: renewal-freegamehost-artifacts
+          path: artifacts/
+          if-no-files-found: ignore
+
+      - name: 🧽 清理进程和临时文件
+        if: always()
+        run: |
+          pkill -f sing-box || true
+          pkill -f chromedriver || true
+          pkill -f chrome || true
+          pkill -f Xvfb || true
+          rm -f sing-box sing-box-config.json sing-box.log
+
+      - name: 🧹 清理旧的工作流运行记录
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          runs=$(gh run list --workflow="${{ github.workflow }}" --limit=100 --json databaseId --jq '.[].databaseId')
+          count=0
+          for run_id in $runs; do
+            count=$((count + 1))
+            if [ $count -gt 1 ]; then
+              echo "删除运行记录: $run_id"
+              gh run delete $run_id || true
+            fi
+          done
