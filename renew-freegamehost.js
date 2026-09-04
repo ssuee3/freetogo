@@ -890,7 +890,7 @@ async function clickRenew(page) {
     log('🖱️ 点击 EXTEND SERVER +8 HOURS...');
     const ok = await page.evaluate(() => {
         const btns = Array.from(document.querySelectorAll('button'));
-        const b = btns.find((el) => /RENEW \+8 HOURS/i.test((el.textContent || '').replace(/\s+/g, ' ')));
+        const b = btns.find((el) => /EXTEND SERVER \+8 HOURS/i.test((el.textContent || '').replace(/\s+/g, ' ')));
         if (!b || b.disabled) return false;
         b.click();
         return true;
