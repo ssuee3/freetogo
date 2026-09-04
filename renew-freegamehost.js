@@ -887,7 +887,7 @@ async function openServer(page) {
 }
 
 async function clickRenew(page) {
-    log('🖱️ 点击 RENEW +8 HOURS...');
+    log('🖱️ 点击 EXTEND SERVER +8 HOURS...');
     const ok = await page.evaluate(() => {
         const btns = Array.from(document.querySelectorAll('button'));
         const b = btns.find((el) => /RENEW \+8 HOURS/i.test((el.textContent || '').replace(/\s+/g, ' ')));
@@ -897,7 +897,7 @@ async function clickRenew(page) {
     });
     if (!ok) {
         await screenshot(page, 'no_renew_button.png');
-        throw new Error('未找到可点击的 RENEW +8 HOURS 按钮（可能在冷却中）');
+        throw new Error('未找到可点击的 EXTEND SERVER +8 HOURS 按钮（可能在冷却中）');
     }
 }
 
