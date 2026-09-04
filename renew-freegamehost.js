@@ -861,7 +861,7 @@ async function readRenewState(page) {
         const failedLoad = /failed to load\. try again/i.test(body);
         const security = /complete security check to renew/i.test(body);
         const renewBtn = Array.from(document.querySelectorAll('button')).some((el) =>
-            /EXTEND SERVER \+8 HOURS/i.test((el.textContent || '').replace(/\s+/g, ' '))
+            /(?:EXTEND SERVER|RENEW) \+8 HOURS/i.test((el.textContent || '').replace(/\s+/g, ' '))
         );
         const flash = Array.from(document.querySelectorAll('[role="alert"], .alert, .Toastify')).map((el) =>
             (el.textContent || '').trim().replace(/\s+/g, ' ')
@@ -890,7 +890,7 @@ async function clickRenew(page) {
     log('🖱️ 点击 EXTEND SERVER +8 HOURS...');
     const ok = await page.evaluate(() => {
         const btns = Array.from(document.querySelectorAll('button'));
-        const b = btns.find((el) => /EXTEND SERVER \+8 HOURS/i.test((el.textContent || '').replace(/\s+/g, ' ')));
+        const b = btns.find((el) => /(?:EXTEND SERVER|RENEW) \+8 HOURS/i.test((el.textContent || '').replace(/\s+/g, ' ')));
         if (!b || b.disabled) return false;
         b.click();
         return true;
@@ -992,7 +992,7 @@ async function waitTurnstileSolved(page, timeoutS = 75) {
             loggedWaitAuto = false;
             retried += 1;
         } else if (!cfUrls.length && (i === 14 || i === 32) && retried < 2) {
-            log('⚠️ 未出现 Turnstile iframe，取消后重试点击 RENEW...');
+            log('⚠️ 未出现 Turnstile iframe，取消后重试点击 EXTEND SERVER...');
             await page.evaluate(() => {
                 const cancel = Array.from(document.querySelectorAll('button')).find((el) =>
                     (el.textContent || '').trim().toLowerCase() === 'cancel'
@@ -1007,7 +1007,7 @@ async function waitTurnstileSolved(page, timeoutS = 75) {
             retried += 1;
         }
         if (st.failedLoad && i > 12 && i % 15 === 0) {
-            log('⚠️ Turnstile 加载失败，取消后重试点击 RENEW...');
+            log('⚠️ Turnstile 加载失败，重试点击 EXTEND SERVER...');
             await page.evaluate(() => {
                 const cancel = Array.from(document.querySelectorAll('button')).find((el) =>
                     (el.textContent || '').trim().toLowerCase() === 'cancel'
@@ -1045,7 +1045,7 @@ async function renew(page) {
 
     if (!before.renewBtn) {
         await screenshot(page, 'no_renew_button.png');
-        throw new Error('页面上没有 RENEW +8 HOURS 按钮');
+        throw new Error('页面上没有 EXTEND SERVER +8 HOURS 按钮');
     }
 
     await clickRenew(page);
