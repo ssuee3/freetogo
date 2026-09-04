@@ -861,7 +861,7 @@ async function readRenewState(page) {
         const failedLoad = /failed to load\. try again/i.test(body);
         const security = /complete security check to renew/i.test(body);
         const renewBtn = Array.from(document.querySelectorAll('button')).some((el) =>
-            /RENEW \+8 HOURS/i.test((el.textContent || '').replace(/\s+/g, ' '))
+            /EXTEND SERVER \+8 HOURS/i.test((el.textContent || '').replace(/\s+/g, ' '))
         );
         const flash = Array.from(document.querySelectorAll('[role="alert"], .alert, .Toastify')).map((el) =>
             (el.textContent || '').trim().replace(/\s+/g, ' ')
