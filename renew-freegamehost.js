@@ -861,7 +861,7 @@ async function readRenewState(page) {
         const failedLoad = /failed to load\. try again/i.test(body);
         const security = /complete security check to renew/i.test(body);
         const renewBtn = Array.from(document.querySelectorAll('button')).some((el) =>
-            /(?:EXTEND SERVER|RENEW) \+8 HOURS/i.test((el.textContent || '').replace(/\s+/g, ' '))
+            /(?:EXTEND\s*SERVER|RENEW)\s*\+\s*8\s*HOURS/i.test((el.textContent || '').replace(/\s+/g, ' '))
         );
         const flash = Array.from(document.querySelectorAll('[role="alert"], .alert, .Toastify')).map((el) =>
             (el.textContent || '').trim().replace(/\s+/g, ' ')
@@ -890,7 +890,7 @@ async function clickRenew(page) {
     log('🖱️ 点击 EXTEND SERVER +8 HOURS...');
     const ok = await page.evaluate(() => {
         const btns = Array.from(document.querySelectorAll('button'));
-        const b = btns.find((el) => /(?:EXTEND SERVER|RENEW) \+8 HOURS/i.test((el.textContent || '').replace(/\s+/g, ' ')));
+        const b = btns.find((el) => /(?:EXTEND\s*SERVER|RENEW)\s*\+\s*8\s*HOURS/i.test((el.textContent || '').replace(/\s+/g, ' ')));
         if (!b || b.disabled) return false;
         b.click();
         return true;
