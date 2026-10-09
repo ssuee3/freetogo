@@ -46,8 +46,9 @@ jobs:
           SESSION_COOKIES: ${{ secrets.SESSION_COOKIES }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-          TURNSTILE_LIB_SOLVER: 'false'
+          TURNSTILE_LIB_SOLVER: 'true'
           TURNSTILE_NO_CLICK: 'true'
+          TURNSTILE_WAIT_S: '600'
         run: |
           xvfb-run -a node renew-freegamehost.js
 
