@@ -37,7 +37,7 @@ jobs:
         continue-on-error: true
         env:
           NODE_LINK: ${{ secrets.NODE_LINK }}
-       run: bash setup_proxy.sh
+        run: bash setup_proxy.sh
 
       - name: Run renewal script
         env:
