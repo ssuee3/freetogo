@@ -213,8 +213,8 @@ async function launchRealBrowser() {
         '--no-sandbox',
         '--disable-setuid-sandbox',
         '--disable-dev-shm-usage',
-        '--disable-gpu',
-        '--window-size=1280,1600',
+        '--window-size=1366,900',
+        '--lang=en-US,en',
         '--disable-blink-features=AutomationControlled',
     ];
     if (IS_PROXY) args.push(`--proxy-server=${PROXY_SERVER}`);
@@ -231,7 +231,7 @@ async function launchRealBrowser() {
     try {
         ({ browser, page } = await connect({
             headless: false,
-            turnstile: false,
+            turnstile: true,
             disableXvfb: true,
             customConfig: chromePath ? { chromePath } : {},
             connectOption: {
@@ -242,7 +242,7 @@ async function launchRealBrowser() {
     } catch (e) {
         throw new Error(`浏览器启动失败: ${e.message}`);
     }
-    await page.setViewport({ width: 1280, height: 1600 });
+    await page.setViewport({ width: 1366, height: 900 });
     return { browser, page };
 }
 
@@ -277,7 +277,7 @@ function isClickInViewport(pt, viewport) {
     return pt.x >= 0 && pt.y >= 0 && pt.x < viewport.width && pt.y < viewport.height;
 }
 
-const TURNSTILE_AUTO_WAIT_S = 8;
+const TURNSTILE_AUTO_WAIT_S = Math.max(5, parseInt(process.env.TURNSTILE_AUTO_WAIT_S || '20', 10) || 20);
 
 function turnstileAction({ hasToken, hasIframe, iframeAgeS, clicksOnThisWidget }) {
     if (hasToken || !hasIframe) return 'wait';
@@ -912,6 +912,7 @@ async function waitTurnstileSolved(page, timeoutS = 75) {
     let clicksOnThisWidget = 0;
     let widgetWaitStart = 0;
     let retried = 0;
+    let resetTried = false;
     let loggedToken = false;
     let iframeSeenAt = null;
     let loggedWaitAuto = false;
@@ -982,6 +983,17 @@ async function waitTurnstileSolved(page, timeoutS = 75) {
             log(`⏳ Turnstile 仍在求解中... action=${action} cfFrames=${cfUrls.length} tokenLen=${token ? token.length : 0} clicks=${clicksOnThisWidget} age=${iframeAgeS}s`);
         }
         if (clicksOnThisWidget >= 1 && i - widgetWaitStart >= 22 && !token && retried < 2) {
+            if (!resetTried) {
+                resetTried = true;
+                log('⚠️ 点击后仍无 token，先 turnstile.reset() 让控件重新求解...');
+                await page.evaluate(() => {
+                    try {
+                        if (window.turnstile && typeof window.turnstile.reset === 'function') window.turnstile.reset();
+                    } catch (e) { /* ignore */ }
+                });
+                widgetWaitStart = i;
+                continue;
+            }
             log('⚠️ 点击后仍无 token，取消后重开弹窗...');
             await page.evaluate(() => {
                 const cancel = Array.from(document.querySelectorAll('button')).find((el) =>
@@ -995,6 +1007,7 @@ async function waitTurnstileSolved(page, timeoutS = 75) {
             iframeSeenAt = null;
             loggedWaitAuto = false;
             retried += 1;
+            resetTried = false;
         } else if (!cfUrls.length && (i === 14 || i === 32) && retried < 2) {
             log('⚠️ 未出现 Turnstile iframe，取消后重试点击 EXTEND SERVER...');
             await page.evaluate(() => {
@@ -1009,6 +1022,7 @@ async function waitTurnstileSolved(page, timeoutS = 75) {
             iframeSeenAt = null;
             loggedWaitAuto = false;
             retried += 1;
+            resetTried = false;
         }
         if (st.failedLoad && i > 12 && i % 15 === 0) {
             log('⚠️ Turnstile 加载失败，重试点击 EXTEND SERVER...');
