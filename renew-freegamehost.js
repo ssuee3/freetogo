@@ -34,7 +34,9 @@ const TG_BOT_TOKEN = process.env.TG_BOT_TOKEN || '';
 const TG_CHAT_ID = process.env.TG_CHAT_ID || '';
 // 慢速节点下页面/验证加载较慢，可通过环境变量加大等待时间（秒）
 const SERVER_PAGE_WAIT_S = Math.max(20, parseInt(process.env.SERVER_PAGE_WAIT_S || '60', 10) || 60);
-const TURNSTILE_WAIT_S = Math.max(40, parseInt(process.env.TURNSTILE_WAIT_S || '120', 10) || 120);
+const TURNSTILE_WAIT_S = Math.max(60, parseInt(process.env.TURNSTILE_WAIT_S || '300', 10) || 300);
+// CF 验证本身需要几十秒，过早点击或取消会打断求解，这里把各阶段耐心放大
+const TURNSTILE_POST_CLICK_WAIT_S = Math.max(20, parseInt(process.env.TURNSTILE_POST_CLICK_WAIT_S || '60', 10) || 60);
 
 const BASE_URL = 'https://panel.freegamehost.xyz';
 const LOGIN_URL = `${BASE_URL}/auth/login`;
@@ -231,7 +233,9 @@ async function launchRealBrowser() {
     try {
         ({ browser, page } = await connect({
             headless: false,
-            turnstile: true,
+            // 内置求解器发现 turnstile 控件会主动点击；若怀疑它打断慢速验证，
+            // 可设 TURNSTILE_LIB_SOLVER=false 关掉，纯等待 + 脚本兜底点击
+            turnstile: (process.env.TURNSTILE_LIB_SOLVER || 'true').toLowerCase() !== 'false',
             disableXvfb: true,
             customConfig: chromePath ? { chromePath } : {},
             connectOption: {
@@ -277,12 +281,14 @@ function isClickInViewport(pt, viewport) {
     return pt.x >= 0 && pt.y >= 0 && pt.x < viewport.width && pt.y < viewport.height;
 }
 
-const TURNSTILE_AUTO_WAIT_S = Math.max(5, parseInt(process.env.TURNSTILE_AUTO_WAIT_S || '20', 10) || 20);
+const TURNSTILE_AUTO_WAIT_S = Math.max(5, parseInt(process.env.TURNSTILE_AUTO_WAIT_S || '45', 10) || 45);
+// TURNSTILE_NO_CLICK=true 时全程不点击控件，纯等待 CF 自己出 token
+const TURNSTILE_NO_CLICK = (process.env.TURNSTILE_NO_CLICK || '').toLowerCase() === 'true';
 
 function turnstileAction({ hasToken, hasIframe, iframeAgeS, clicksOnThisWidget }) {
     if (hasToken || !hasIframe) return 'wait';
     if (clicksOnThisWidget === 0 && iframeAgeS < TURNSTILE_AUTO_WAIT_S) return 'wait-auto';
-    if (clicksOnThisWidget === 0) return 'click';
+    if (clicksOnThisWidget === 0 && !TURNSTILE_NO_CLICK) return 'click';
     return 'wait';
 }
 
@@ -910,7 +916,7 @@ async function waitTurnstileSolved(page, timeoutS = 75) {
     const before = await readRenewState(page);
     const beforeSec = timeToSeconds(before.remain);
     let clicksOnThisWidget = 0;
-    let widgetWaitStart = 0;
+    let widgetWaitStart = null; // 最近一次点击/reset 的时间基准；null 表示处于首轮纯等待
     let retried = 0;
     let resetTried = false;
     let loggedToken = false;
@@ -979,10 +985,12 @@ async function waitTurnstileSolved(page, timeoutS = 75) {
             log(`✅ Turnstile token 已就绪（长度 ${token.length}），等待站点自动提交...`);
         }
 
-        if (i === 8 || i === 20 || i === 40) {
+        if (i > 0 && i % 30 === 0) {
             log(`⏳ Turnstile 仍在求解中... action=${action} cfFrames=${cfUrls.length} tokenLen=${token ? token.length : 0} clicks=${clicksOnThisWidget} age=${iframeAgeS}s`);
         }
-        if (clicksOnThisWidget >= 1 && i - widgetWaitStart >= 22 && !token && retried < 2) {
+        const waitBase = widgetWaitStart != null ? widgetWaitStart : (iframeSeenAt ?? i) + TURNSTILE_AUTO_WAIT_S;
+        const waitedOnWidget = i - waitBase;
+        if (cfUrls.length && waitedOnWidget >= TURNSTILE_POST_CLICK_WAIT_S && !token && retried < 2) {
             if (!resetTried) {
                 resetTried = true;
                 log('⚠️ 点击后仍无 token，先 turnstile.reset() 让控件重新求解...');
@@ -1005,6 +1013,7 @@ async function waitTurnstileSolved(page, timeoutS = 75) {
             await clickRenew(page);
             clicksOnThisWidget = 0;
             iframeSeenAt = null;
+            widgetWaitStart = null;
             loggedWaitAuto = false;
             retried += 1;
             resetTried = false;
@@ -1020,11 +1029,12 @@ async function waitTurnstileSolved(page, timeoutS = 75) {
             await clickRenew(page);
             clicksOnThisWidget = 0;
             iframeSeenAt = null;
+            widgetWaitStart = null;
             loggedWaitAuto = false;
             retried += 1;
             resetTried = false;
         }
-        if (st.failedLoad && i > 12 && i % 15 === 0) {
+        if (st.failedLoad && !cfUrls.length && i > 12 && i % 15 === 0) {
             log('⚠️ Turnstile 加载失败，重试点击 EXTEND SERVER...');
             await page.evaluate(() => {
                 const cancel = Array.from(document.querySelectorAll('button')).find((el) =>
@@ -1036,6 +1046,7 @@ async function waitTurnstileSolved(page, timeoutS = 75) {
             await clickRenew(page);
             clicksOnThisWidget = 0;
             iframeSeenAt = null;
+            widgetWaitStart = null;
             loggedWaitAuto = false;
         }
     }
