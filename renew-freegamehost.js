@@ -218,6 +218,10 @@ async function launchRealBrowser() {
         '--window-size=1366,900',
         '--lang=en-US,en',
         '--disable-blink-features=AutomationControlled',
+        // 无 GPU 环境下启用 SwiftShader 软件渲染，否则 WebGL 不可用（CF 风控强信号）
+        '--enable-unsafe-swiftshader',
+        '--use-gl=angle',
+        '--use-angle=swiftshader',
     ];
     if (IS_PROXY) args.push(`--proxy-server=${PROXY_SERVER}`);
 
