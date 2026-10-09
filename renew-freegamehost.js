@@ -32,6 +32,9 @@ const PROXY_SERVER = (process.env.PROXY_SERVER || '').trim() || 'socks5://127.0.
 const SESSION_COOKIES = (process.env.SESSION_COOKIES || '').trim();
 const TG_BOT_TOKEN = process.env.TG_BOT_TOKEN || '';
 const TG_CHAT_ID = process.env.TG_CHAT_ID || '';
+// 慢速节点下页面/验证加载较慢，可通过环境变量加大等待时间（秒）
+const SERVER_PAGE_WAIT_S = Math.max(20, parseInt(process.env.SERVER_PAGE_WAIT_S || '60', 10) || 60);
+const TURNSTILE_WAIT_S = Math.max(40, parseInt(process.env.TURNSTILE_WAIT_S || '120', 10) || 120);
 
 const BASE_URL = 'https://panel.freegamehost.xyz';
 const LOGIN_URL = `${BASE_URL}/auth/login`;
@@ -873,13 +876,14 @@ async function readRenewState(page) {
 async function openServer(page) {
     const target = `${BASE_URL}/server/${SERVER_ID}`;
     log(`📂 打开服务器页: ${target}`);
-    await page.goto(target, { waitUntil: 'domcontentloaded', timeout: 60000 });
+    await page.goto(target, { waitUntil: 'domcontentloaded', timeout: 120000 });
     await humanWait(2, 4);
     await dismissOverlays(page);
 
-    for (let i = 0; i < 20; i++) {
+    for (let i = 0; i < SERVER_PAGE_WAIT_S; i++) {
         const st = await readRenewState(page);
         if (st.remain || st.renewBtn || st.cooldown) return st;
+        if (i > 0 && i % 15 === 0) log(`⏳ 等待服务器页加载续期区域... ${i}/${SERVER_PAGE_WAIT_S}s`);
         await sleep(1000);
     }
     await screenshot(page, 'server_page_timeout.png');
@@ -1051,7 +1055,7 @@ async function renew(page) {
     await clickRenew(page);
     await humanWait(1, 2);
 
-    const result = await waitTurnstileSolved(page, 80);
+    const result = await waitTurnstileSolved(page, TURNSTILE_WAIT_S);
     if (result.ok) {
         log(`✅ 续期成功: ${result.text}`);
         await screenshot(page, 'renewal_ok.png');
