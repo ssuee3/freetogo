@@ -66,8 +66,10 @@ test('turnstileAction waits for auto before the first click', () => {
     assert.equal(turnstileAction({ hasToken: true, hasIframe: true, iframeAgeS: 0, clicksOnThisWidget: 0 }), 'wait');
     assert.equal(turnstileAction({ hasToken: false, hasIframe: false, iframeAgeS: 0, clicksOnThisWidget: 0 }), 'wait');
     assert.equal(turnstileAction({ hasToken: false, hasIframe: true, iframeAgeS: 3, clicksOnThisWidget: 0 }), 'wait-auto');
-    assert.equal(turnstileAction({ hasToken: false, hasIframe: true, iframeAgeS: 8, clicksOnThisWidget: 0 }), 'click');
-    assert.equal(turnstileAction({ hasToken: false, hasIframe: true, iframeAgeS: 20, clicksOnThisWidget: 1 }), 'wait');
+    assert.equal(turnstileAction({ hasToken: false, hasIframe: true, iframeAgeS: 8, clicksOnThisWidget: 0 }), 'wait-auto');
+    assert.equal(turnstileAction({ hasToken: false, hasIframe: true, iframeAgeS: 25, clicksOnThisWidget: 0 }), 'wait-auto');
+    assert.equal(turnstileAction({ hasToken: false, hasIframe: true, iframeAgeS: 50, clicksOnThisWidget: 0 }), 'click');
+    assert.equal(turnstileAction({ hasToken: false, hasIframe: true, iframeAgeS: 60, clicksOnThisWidget: 1 }), 'wait');
 });
 
 const clock = () => '2026-08-25 16:11:30';
