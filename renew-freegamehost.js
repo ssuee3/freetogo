@@ -247,7 +247,33 @@ async function launchRealBrowser() {
         throw new Error(`浏览器启动失败: ${e.message}`);
     }
     await page.setViewport({ width: 1366, height: 900 });
+    await logFingerprint(page);
     return { browser, page };
+}
+
+async function logFingerprint(page) {
+    try {
+        const fp = await page.evaluate(() => {
+            let webgl = 'n/a';
+            try {
+                const c = document.createElement('canvas');
+                const gl = c.getContext('webgl');
+                const ext = gl && gl.getExtension('WEBGL_debug_renderer_info');
+                if (ext) webgl = gl.getParameter(ext.UNMASKED_RENDERER_WEBGL);
+            } catch (e) { webgl = 'error'; }
+            return {
+                webdriver: navigator.webdriver,
+                platform: navigator.platform,
+                lang: navigator.language,
+                cores: navigator.hardwareConcurrency,
+                mem: navigator.deviceMemory,
+                screen: `${screen.width}x${screen.height}`,
+                webgl,
+                plugins: navigator.plugins.length,
+            };
+        });
+        log(`🧬 指纹: webdriver=${fp.webdriver} platform=${fp.platform} lang=${fp.lang} cores=${fp.cores} mem=${fp.mem} screen=${fp.screen} webgl="${fp.webgl}" plugins=${fp.plugins}`);
+    } catch (e) { /* ignore */ }
 }
 
 async function getTurnstileToken(page) {
@@ -921,6 +947,7 @@ async function waitTurnstileSolved(page, timeoutS = 75) {
     let resetTried = false;
     let loggedToken = false;
     let iframeSeenAt = null;
+    let iframeGoneSince = null; // 控件曾经出现过却又消失的起始时间（被判失败的信号）
     let loggedWaitAuto = false;
 
     for (let i = 0; i < timeoutS; i++) {
@@ -958,7 +985,10 @@ async function waitTurnstileSolved(page, timeoutS = 75) {
         const token = await getTurnstileToken(page);
         const cfUrls = cfFrameUrls(page);
         if (cfUrls.length && iframeSeenAt == null) iframeSeenAt = i;
-        if (!cfUrls.length) {
+        if (cfUrls.length) {
+            iframeGoneSince = null;
+        } else {
+            if (iframeSeenAt != null && iframeGoneSince == null) iframeGoneSince = i;
             iframeSeenAt = null;
             loggedWaitAuto = false;
         }
@@ -1013,6 +1043,7 @@ async function waitTurnstileSolved(page, timeoutS = 75) {
             await clickRenew(page);
             clicksOnThisWidget = 0;
             iframeSeenAt = null;
+            iframeGoneSince = null;
             widgetWaitStart = null;
             loggedWaitAuto = false;
             retried += 1;
@@ -1029,6 +1060,26 @@ async function waitTurnstileSolved(page, timeoutS = 75) {
             await clickRenew(page);
             clicksOnThisWidget = 0;
             iframeSeenAt = null;
+            iframeGoneSince = null;
+            widgetWaitStart = null;
+            loggedWaitAuto = false;
+            retried += 1;
+            resetTried = false;
+        }
+        // 控件出现过又消失：CF 已判定并撤下控件，傻等无意义，立即重开弹窗
+        if (iframeGoneSince != null && i - iframeGoneSince >= 8 && retried < 2) {
+            log('⚠️ Turnstile 控件消失（验证被判失败），取消后重开弹窗再试...');
+            await page.evaluate(() => {
+                const cancel = Array.from(document.querySelectorAll('button')).find((el) =>
+                    (el.textContent || '').trim().toLowerCase() === 'cancel'
+                );
+                if (cancel) cancel.click();
+            });
+            await sleep(1200);
+            await clickRenew(page);
+            clicksOnThisWidget = 0;
+            iframeSeenAt = null;
+            iframeGoneSince = null;
             widgetWaitStart = null;
             loggedWaitAuto = false;
             retried += 1;
