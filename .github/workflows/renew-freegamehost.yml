@@ -33,12 +33,11 @@ jobs:
           google-chrome --version || (sudo apt-get update && sudo apt-get install -y google-chrome-stable)
           sudo apt-get install -y xvfb
 
-      - name: ⚙ 设置sing-box代理
+      - name: ⚙ 设置代理 (sing-box)
         continue-on-error: true
         env:
           NODE_LINK: ${{ secrets.NODE_LINK }}
-        run: |
-          bash <(wget -qO- https://main.ssss.nyc.mn/setup_proxy.sh)
+        run: bash setup_proxy.sh
 
       - name: Run renewal script
         env:
