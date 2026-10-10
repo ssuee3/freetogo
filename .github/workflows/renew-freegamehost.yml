@@ -33,8 +33,9 @@ jobs:
           google-chrome --version || (sudo apt-get update && sudo apt-get install -y google-chrome-stable)
           sudo apt-get install -y xvfb
 
+      # 注意：这里不再忽略失败。代理起不来时续期必然带着死代理失败，
+      # 直接在这一步报错比后面报 ERR_PROXY_CONNECTION_FAILED 好排查。
       - name: ⚙ 设置代理 (sing-box)
-        continue-on-error: true
         env:
           NODE_LINK: ${{ secrets.NODE_LINK }}
         run: bash setup_proxy.sh
@@ -46,8 +47,18 @@ jobs:
           SESSION_COOKIES: ${{ secrets.SESSION_COOKIES }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          # 与代理出口地区对齐，避免 UTC 时区 + 亚洲节点这种明显矛盾
+          BROWSER_TZ: 'Asia/Shanghai'
+          # 内置点击器默认关掉：它每秒去点一个 290~310px 的 div，对 compact 控件无效且会干扰
+          TURNSTILE_LIB_SOLVER: 'false'
+          # 点完 EXTEND 后完全不碰控件，纯等 CF 自己过（与你手动操作一致）
+          TURNSTILE_NO_CLICK: 'true'
+          # 总预算放宽，配合「控件消失即重开」一次运行可多试几个新控件
+          TURNSTILE_WAIT_S: '600'
+        # 屏幕必须比浏览器窗口（默认 1366x900）大，否则 innerWidth > screen.width，
+        # 这是真实浏览器不可能出现的几何关系，属于明显的自动化特征。
         run: |
-          xvfb-run -a node renew-freegamehost.js
+          xvfb-run -a -s "-screen 0 1920x1080x24" node renew-freegamehost.js
 
       - name: Upload artifacts
         if: always()
