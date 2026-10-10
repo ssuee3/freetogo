@@ -18,6 +18,15 @@
  *   SESSION_COOKIES  可选，已登录会话 cookie（Cookie header 或 Chrome 导出的 JSON），存在时优先复用会话
  *   TG_BOT_TOKEN     Telegram bot token
  *   TG_CHAT_ID       Telegram chat id
+ *
+ * Turnstile / 指纹相关（都有合理默认，通常无需设置）：
+ *   TURNSTILE_AUTO_WAIT_S        点 EXTEND 后完全不碰控件的纯等待秒数，默认 45
+ *   TURNSTILE_POST_CLICK_WAIT_S  点击/reset 后继续安静等待的秒数，默认 60
+ *   TURNSTILE_WAIT_S             整体预算，默认 300
+ *   TURNSTILE_NO_CLICK=true      全程不主动点击控件（纯等 CF 自己过）
+ *   TURNSTILE_LIB_SOLVER=true    启用 puppeteer-real-browser 内置点击器（默认关，它会每秒戳控件）
+ *   BROWSER_TZ                   浏览器时区，如 Asia/Shanghai（对齐代理出口）
+ *   BROWSER_WINDOW               浏览器窗口，如 1366x900；须小于 Xvfb 屏幕
  */
 
 const fs = require('fs');
@@ -32,6 +41,11 @@ const PROXY_SERVER = (process.env.PROXY_SERVER || '').trim() || 'socks5://127.0.
 const SESSION_COOKIES = (process.env.SESSION_COOKIES || '').trim();
 const TG_BOT_TOKEN = process.env.TG_BOT_TOKEN || '';
 const TG_CHAT_ID = process.env.TG_CHAT_ID || '';
+// 慢速节点下页面/验证加载较慢，可通过环境变量加大等待时间（秒）
+const SERVER_PAGE_WAIT_S = Math.max(20, parseInt(process.env.SERVER_PAGE_WAIT_S || '60', 10) || 60);
+const TURNSTILE_WAIT_S = Math.max(60, parseInt(process.env.TURNSTILE_WAIT_S || '300', 10) || 300);
+// CF 验证本身需要几十秒，过早点击或取消会打断求解，这里把各阶段耐心放大
+const TURNSTILE_POST_CLICK_WAIT_S = Math.max(20, parseInt(process.env.TURNSTILE_POST_CLICK_WAIT_S || '60', 10) || 60);
 
 const BASE_URL = 'https://panel.freegamehost.xyz';
 const LOGIN_URL = `${BASE_URL}/auth/login`;
@@ -205,16 +219,49 @@ async function restoreSession(page) {
     }
 }
 
-async function launchRealBrowser() {
+// 浏览器窗口尺寸；Xvfb 屏幕必须比它大（见 yml 的 xvfb-run -screen），否则
+// innerWidth > screen.width，这是真实浏览器不可能出现的几何关系。
+const BROWSER_WINDOW = (process.env.BROWSER_WINDOW || '1366x900').trim();
+
+// puppeteer-real-browser 默认（ignoreAllFlags 不为 true 时）会注入 chrome-launcher 的整套
+// 「Lighthouse / 自动化测试」参数，其中这些本身就是机器味来源：
+//   --disable-extensions（window.chrome.runtime 缺失）、--disable-background-timer-throttling、
+//   --disable-ipc-flooding-protection、--mute-audio、--disable-features=... AutomationControlled
+// 这里改为 ignoreAllFlags + 自己的最小参数集，只保留真正必要的启动项。
+function buildChromeArgs({ proxy = '', win = BROWSER_WINDOW, extra = [] } = {}) {
+    const size = /^\d+x\d+$/.test(win) ? win.replace('x', ',') : '1366,900';
     const args = [
         '--no-sandbox',
         '--disable-setuid-sandbox',
         '--disable-dev-shm-usage',
-        '--disable-gpu',
-        '--window-size=1280,1600',
+        // 跳过首启向导：新 profile 下缺这两个会弹欢迎页/默认浏览器提示，盖住站点
+        '--no-first-run',
+        '--no-default-browser-check',
+        '--password-store=basic',
+        '--use-mock-keychain',
+        `--window-size=${size}`,
+        '--window-position=0,0',
+        '--lang=en-US,en',
         '--disable-blink-features=AutomationControlled',
+        // 无 GPU 环境下启用 SwiftShader 软件渲染，否则 WebGL 不可用（CF 风控强信号）
+        '--enable-unsafe-swiftshader',
+        '--use-gl=angle',
+        '--use-angle=swiftshader',
     ];
-    if (IS_PROXY) args.push(`--proxy-server=${PROXY_SERVER}`);
+    if (proxy) {
+        args.push(`--proxy-server=${proxy}`);
+        // 浏览器级代理下 WebRTC 仍会走真实网卡发 STUN，把 runner 的真实 IP 暴露给
+        // Cloudflare，与代理出口 IP 不一致 —— 这是最直接的机器人判据之一。
+        args.push('--force-webrtc-ip-handling-policy=disable_non_proxied_udp');
+    }
+    return [...args, ...extra];
+}
+
+async function launchRealBrowser() {
+    // 时区与代理出口对齐（GH runner 默认 UTC，和亚洲节点+中文账号组合明显不符）
+    if (process.env.BROWSER_TZ) process.env.TZ = process.env.BROWSER_TZ;
+
+    const args = buildChromeArgs({ proxy: IS_PROXY ? PROXY_SERVER : '' });
 
     const chromePath = fs.existsSync('/usr/bin/google-chrome')
         ? '/usr/bin/google-chrome'
@@ -222,16 +269,23 @@ async function launchRealBrowser() {
             ? '/usr/bin/google-chrome-stable'
             : undefined;
 
-    log('🚀 启动浏览器（puppeteer-real-browser / turnstile）');
+    // 注意：库里的 turnstile:true 仅仅是启动一个「每 1 秒扫一遍并点击 290~310px 空 div」的
+    // 循环（lib/cjs/module/turnstile.js），不带任何指纹补丁；pageController 里的 screenX/screenY
+    // 补丁是无条件生效的。所以默认关闭它，避免它每秒戳一次控件打断 CF 求解。
+    const libSolver = (process.env.TURNSTILE_LIB_SOLVER || 'false').toLowerCase() === 'true';
+
+    log(`🚀 启动浏览器（puppeteer-real-browser / libSolver=${libSolver}）`);
     let browser;
     let page;
     try {
         ({ browser, page } = await connect({
             headless: false,
-            turnstile: false,
+            turnstile: libSolver,
             disableXvfb: true,
+            ignoreAllFlags: true,
             customConfig: chromePath ? { chromePath } : {},
             connectOption: {
+                // 不强制 viewport：让视口等于真实窗口内容区，避免造出 innerWidth>screen.width
                 defaultViewport: null,
             },
             args,
@@ -239,8 +293,77 @@ async function launchRealBrowser() {
     } catch (e) {
         throw new Error(`浏览器启动失败: ${e.message}`);
     }
-    await page.setViewport({ width: 1280, height: 1600 });
+    await logFingerprint(page);
+    // 网络诊断 + 点击计数埋点在启动时就注入，保证复用 cookie 直接进服务器页时也生效
+    await attachLoginDiagnostics(page);
     return { browser, page };
+}
+
+async function logFingerprint(page) {
+    try {
+        const fp = await page.evaluate(() => {
+            // 必须读页面上已存在/复用的 canvas，而不是新建一个——新建的恒为 software，
+            // 读不出真实的 WebGL 渲染器，也没有反指纹噪音，等于测不到点上。
+            let webgl = 'n/a';
+            let noise = 'n/a';
+            try {
+                let gl = null;
+                const existing = Array.from(document.querySelectorAll('canvas')).find((c) => {
+                    try { return !!(c.getContext('webgl') || c.getContext('experimental-webgl')); } catch (e) { return false; }
+                });
+                const c = existing || document.createElement('canvas');
+                gl = c.getContext('webgl') || c.getContext('experimental-webgl');
+                if (gl) {
+                    const ext = gl.getExtension('WEBGL_debug_renderer_info');
+                    if (ext) webgl = gl.getParameter(ext.UNMASKED_RENDERER_WEBGL);
+                    else webgl = gl.getParameter(gl.RENDERER);
+                    // Chrome 会对 WebGL 参数注入厂商相关的固定噪音；同一机器两次调用的
+                    // 结果应「相同」，不同机器不同。全 0 说明是软件渲染（高熵指纹暴露）。
+                    const p = gl.getParameter(gl.MAX_TEXTURE_SIZE);
+                    noise = `${p}`;
+                } else {
+                    webgl = 'no-context';
+                }
+            } catch (e) { webgl = 'error'; }
+            let uaData = 'n/a';
+            try { uaData = navigator.userAgentData ? navigator.userAgentData.platform : 'absent'; } catch (e) { /* */ }
+            let chromeObj = 'n/a';
+            try { chromeObj = window.chrome && window.chrome.runtime ? 'runtime' : (window.chrome ? 'no-runtime' : 'absent'); } catch (e) { /* */ }
+            return {
+                webdriver: navigator.webdriver,
+                platform: navigator.platform,
+                lang: navigator.language,
+                langs: (navigator.languages || []).join(','),
+                cores: navigator.hardwareConcurrency,
+                mem: navigator.deviceMemory,
+                screen: `${screen.width}x${screen.height}`,
+                avail: `${screen.availWidth}x${screen.availHeight}`,
+                inner: `${innerWidth}x${innerHeight}`,
+                dpr: window.devicePixelRatio,
+                tz: Intl.DateTimeFormat().resolvedOptions().timeZone,
+                webgl,
+                noise,
+                maxTouch: navigator.maxTouchPoints,
+                uaData,
+                chromeObj,
+                plugins: navigator.plugins.length,
+            };
+        });
+        log(`🧬 指纹: webdriver=${fp.webdriver} platform=${fp.platform} lang=${fp.lang} langs=[${fp.langs}] cores=${fp.cores} mem=${fp.mem} tz=${fp.tz} uaData=${fp.uaData} chrome=${fp.chromeObj}`);
+        log(`🧬 指纹: screen=${fp.screen} avail=${fp.avail} inner=${fp.inner} dpr=${fp.dpr} maxTouch=${fp.maxTouch} plugins=${fp.plugins} webgl="${fp.webgl}" maxTex=${fp.noise}`);
+        // 真实浏览器里 innerWidth/Height <= screen.width/height 恒成立（有浏览器 chrome 会更小）。
+        // 一旦大于，就是 headless / 视口被强设的特征；若窗口也等于屏幕，说明是无边框的 Xvfb 全屏。
+        try {
+            const [sw, sh] = fp.screen.split('x').map(Number);
+            const [iw, ih] = fp.inner.split('x').map(Number);
+            if (iw > sw || ih > sh) {
+                log(`⚠️ 几何异常: inner(${fp.inner}) > screen(${fp.screen})，真实浏览器不会这样 —— 请把 Xvfb 屏幕改大于窗口（-screen 0 1920x1080x24）`);
+            }
+            if (iw === sw && ih === sh) {
+                log(`⚠️ 几何可疑: 视口与屏幕完全相等（${fp.screen}），通常是无边框 Xvfb 全屏；真机应略小于屏幕`);
+            }
+        } catch (e) { /* ignore */ }
+    } catch (e) { /* ignore */ }
 }
 
 async function getTurnstileToken(page) {
@@ -274,12 +397,26 @@ function isClickInViewport(pt, viewport) {
     return pt.x >= 0 && pt.y >= 0 && pt.x < viewport.width && pt.y < viewport.height;
 }
 
-const TURNSTILE_AUTO_WAIT_S = 8;
+const TURNSTILE_AUTO_WAIT_S = Math.max(5, parseInt(process.env.TURNSTILE_AUTO_WAIT_S || '45', 10) || 45);
+// TURNSTILE_NO_CLICK=true 时全程不点击控件，纯等待 CF 自己出 token
+const TURNSTILE_NO_CLICK = (process.env.TURNSTILE_NO_CLICK || '').toLowerCase() === 'true';
+
+// 控件中途重渲染（URL 变化）视为新一代控件：CF 会换新的 iframe 继续求解，
+// 旧的等待计时必须作废，否则会立刻触发 reset/取消，把新一轮验证又打断。
+function turnstileWidgetKey(url) {
+    if (!url) return '';
+    try {
+        const u = new URL(url);
+        return `${u.host}${u.pathname}`;
+    } catch (e) {
+        return String(url).slice(0, 80);
+    }
+}
 
 function turnstileAction({ hasToken, hasIframe, iframeAgeS, clicksOnThisWidget }) {
     if (hasToken || !hasIframe) return 'wait';
     if (clicksOnThisWidget === 0 && iframeAgeS < TURNSTILE_AUTO_WAIT_S) return 'wait-auto';
-    if (clicksOnThisWidget === 0) return 'click';
+    if (clicksOnThisWidget === 0 && !TURNSTILE_NO_CLICK) return 'click';
     return 'wait';
 }
 
@@ -346,9 +483,37 @@ async function scrollTurnstileIntoView(page) {
     await sleep(400);
 }
 
+// 视口尺寸：defaultViewport 为 null 时 page.viewport() 返回 null，
+// 此时必须读页面真实的 innerWidth/innerHeight，否则坐标换算会用到过期默认值。
+async function getViewportSize(page) {
+    const vp = page.viewport();
+    if (vp && vp.width && vp.height) return { width: vp.width, height: vp.height };
+    try {
+        const size = await page.evaluate(() => ({ width: window.innerWidth, height: window.innerHeight }));
+        if (size && size.width && size.height) return size;
+    } catch (e) { /* ignore */ }
+    return { width: 1366, height: 900 };
+}
+
+// Turnstile 会看页面级的鼠标活动痕迹。纯自动化点击只有「move+click」两条事件，
+// 中间没有任何自然漂移，是很容易被识别的模式。这里在等待期间做几次小幅移动。
+async function humanMouseJiggle(page, moves = 3) {
+    try {
+        const vp = await getViewportSize(page);
+        let x = Math.round(vp.width * (0.3 + Math.random() * 0.4));
+        let y = Math.round(vp.height * (0.3 + Math.random() * 0.4));
+        for (let i = 0; i < moves; i++) {
+            x = Math.max(10, Math.min(vp.width - 10, x + (Math.random() - 0.5) * 120));
+            y = Math.max(10, Math.min(vp.height - 10, y + (Math.random() - 0.5) * 90));
+            await page.mouse.move(x, y, { steps: 6 + Math.floor(Math.random() * 8) });
+            await sleep(120 + Math.random() * 220);
+        }
+    } catch (e) { /* ignore */ }
+}
+
 async function clickTurnstileWidgets(page) {
     await scrollTurnstileIntoView(page);
-    const viewport = page.viewport() || { width: 1280, height: 1600 };
+    const viewport = await getViewportSize(page);
     const boxes = await findTurnstileIframeBoxes(page);
     const seen = new Set();
     let clicked = 0;
@@ -709,6 +874,13 @@ async function attachLoginDiagnostics(page) {
         await page.evaluateOnNewDocument(() => {
             window.__net = [];
             window.__netCursor = 0;
+            // 统计主文档上的真实点击次数：用于识别 puppeteer-real-browser 内置求解器的
+            // 「每秒戳一次」行为（它只改动 window 上的对象，页面可观测，最可靠）。
+            window.__libClickCount = 0;
+            try {
+                window.addEventListener('mousedown', () => { window.__libClickCount += 1; }, true);
+                window.addEventListener('pointerdown', () => { window.__libClickCount += 1; }, true);
+            } catch (e) { /* */ }
             const rec = (o) => { try { window.__net.push(o); if (window.__net.length > 60) window.__net.shift(); } catch (e) { /* */ } };
             const of = window.fetch;
             if (of) {
@@ -873,13 +1045,14 @@ async function readRenewState(page) {
 async function openServer(page) {
     const target = `${BASE_URL}/server/${SERVER_ID}`;
     log(`📂 打开服务器页: ${target}`);
-    await page.goto(target, { waitUntil: 'domcontentloaded', timeout: 60000 });
+    await page.goto(target, { waitUntil: 'domcontentloaded', timeout: 120000 });
     await humanWait(2, 4);
     await dismissOverlays(page);
 
-    for (let i = 0; i < 20; i++) {
+    for (let i = 0; i < SERVER_PAGE_WAIT_S; i++) {
         const st = await readRenewState(page);
         if (st.remain || st.renewBtn || st.cooldown) return st;
+        if (i > 0 && i % 15 === 0) log(`⏳ 等待服务器页加载续期区域... ${i}/${SERVER_PAGE_WAIT_S}s`);
         await sleep(1000);
     }
     await screenshot(page, 'server_page_timeout.png');
@@ -901,16 +1074,34 @@ async function clickRenew(page) {
     }
 }
 
+// 读取页面上的累计点击次数（主文档监听；跨源 iframe 上的点击可能观测不到）
+async function readPageClickCount(page) {
+    try {
+        const r = await page.evaluate(() => window.__libClickCount);
+        return typeof r === 'number' ? r : null;
+    } catch (e) {
+        return null;
+    }
+}
+
 async function waitTurnstileSolved(page, timeoutS = 75) {
     log('📡 等待 Turnstile（compact/auto）求解并提交续期...');
     const before = await readRenewState(page);
     const beforeSec = timeToSeconds(before.remain);
-    let clicksOnThisWidget = 0;
-    let widgetWaitStart = 0;
+    let ourClicks = 0;          // 脚本自己点的次数
+    let libClicksSinceWidget = 0; // 内置求解器在当前控件上点的次数
+    let widgetWaitStart = null; // 最近一次点击/reset 的时间基准；null 表示处于首轮纯等待
     let retried = 0;
+    let resetTried = false;
     let loggedToken = false;
     let iframeSeenAt = null;
+    let iframeGoneSince = null; // 控件曾经出现过却又消失的起始时间（被判失败的信号）
     let loggedWaitAuto = false;
+    let lastWidgetKey = '';     // 当前控件实例标识（URL），变化即代表 CF 换了新控件
+    let lastPageClickCount = 0; // 页面累计点击（含脚本自己的），用于推算内置求解器的点击
+    let ourClicksAtLastRead = 0;
+    const libSolverOn = (process.env.TURNSTILE_LIB_SOLVER || 'false').toLowerCase() === 'true';
+    let lastJiggle = 0;
 
     for (let i = 0; i < timeoutS; i++) {
         await sleep(1000);
@@ -946,11 +1137,41 @@ async function waitTurnstileSolved(page, timeoutS = 75) {
 
         const token = await getTurnstileToken(page);
         const cfUrls = cfFrameUrls(page);
+        const widgetKey = turnstileWidgetKey(cfUrls[0]);
+
+        // 内置求解器（turnstile:true）会在同一个控件上每秒戳一次。它的点击不进我们的
+        // 计数，但同样会打断 CF 求解，所以必须算进来，否则脚本 45s 后再补一刀 = 双重打断。
+        // 页面计数包含我们自己发的点击，故按增量减去自己的部分。
+        if (libSolverOn) {
+            const c = await readPageClickCount(page);
+            if (c != null) {
+                const deltaTotal = Math.max(0, c - lastPageClickCount);
+                const deltaOurs = Math.max(0, ourClicks - ourClicksAtLastRead);
+                libClicksSinceWidget += Math.max(0, deltaTotal - deltaOurs);
+                lastPageClickCount = c;
+                ourClicksAtLastRead = ourClicks;
+            }
+        }
+
+        // 控件被替换成新一代（URL 变化）：旧计时作废，重新给足纯等待窗口
+        if (cfUrls.length && widgetKey && widgetKey !== lastWidgetKey) {
+            if (lastWidgetKey) {
+                log('🔄 Turnstile 控件已更新为新实例，重新计时等待');
+                iframeSeenAt = i;
+                widgetWaitStart = null;
+                if (ourClicks + libClicksSinceWidget === 0) loggedWaitAuto = false;
+            }
+            lastWidgetKey = widgetKey;
+        }
         if (cfUrls.length && iframeSeenAt == null) iframeSeenAt = i;
-        if (!cfUrls.length) {
+        if (cfUrls.length) {
+            iframeGoneSince = null;
+        } else {
+            if (iframeSeenAt != null && iframeGoneSince == null) iframeGoneSince = i;
             iframeSeenAt = null;
             loggedWaitAuto = false;
         }
+        const clicksOnThisWidget = ourClicks + libClicksSinceWidget;
         const iframeAgeS = iframeSeenAt == null ? 0 : i - iframeSeenAt;
         const action = turnstileAction({
             hasToken: !!token,
@@ -965,7 +1186,7 @@ async function waitTurnstileSolved(page, timeoutS = 75) {
         if (action === 'click') {
             const hit = await clickTurnstileWidgets(page);
             if (hit.clicked) {
-                clicksOnThisWidget += 1;
+                ourClicks += 1;
                 widgetWaitStart = i;
                 log(`🖱️ 已点 Turnstile compact 控件 ${hit.size || ''}（auto 未出 token，点一次后等待）`);
             }
@@ -974,11 +1195,21 @@ async function waitTurnstileSolved(page, timeoutS = 75) {
             log(`✅ Turnstile token 已就绪（长度 ${token.length}），等待站点自动提交...`);
         }
 
-        if (i === 8 || i === 20 || i === 40) {
-            log(`⏳ Turnstile 仍在求解中... action=${action} cfFrames=${cfUrls.length} tokenLen=${token ? token.length : 0} clicks=${clicksOnThisWidget} age=${iframeAgeS}s`);
+        // 等待期间做几次自然鼠标漂移，补上「页面级鼠标活动」痕迹（真实用户一直有）
+        if (action !== 'click' && cfUrls.length && !token && i - lastJiggle >= 15) {
+            lastJiggle = i;
+            await humanMouseJiggle(page, 2);
         }
-        if (clicksOnThisWidget >= 1 && i - widgetWaitStart >= 22 && !token && retried < 2) {
-            log('⚠️ 点击后仍无 token，取消后重开弹窗...');
+
+        if (i > 0 && i % 30 === 0) {
+            log(`⏳ Turnstile 仍在求解中... action=${action} cfFrames=${cfUrls.length} tokenLen=${token ? token.length : 0} clicks=${clicksOnThisWidget}(ours=${ourClicks},lib=${libClicksSinceWidget}) age=${iframeAgeS}s`);
+        }
+        const waitBase = widgetWaitStart != null ? widgetWaitStart : (iframeSeenAt ?? i) + TURNSTILE_AUTO_WAIT_S;
+        const waitedOnWidget = i - waitBase;
+        // 取消当前弹窗并重新点 EXTEND，换一个全新的 Turnstile 控件再试一轮。
+        // （原先这段逻辑在四个分支里各抄一遍，改一处漏三处，这里统一成一个函数。）
+        const reopenWidget = async (reason) => {
+            log(`⚠️ ${reason}，取消后重开弹窗再试...`);
             await page.evaluate(() => {
                 const cancel = Array.from(document.querySelectorAll('button')).find((el) =>
                     (el.textContent || '').trim().toLowerCase() === 'cancel'
@@ -987,26 +1218,42 @@ async function waitTurnstileSolved(page, timeoutS = 75) {
             });
             await sleep(1200);
             await clickRenew(page);
-            clicksOnThisWidget = 0;
+            ourClicks = 0;
+            libClicksSinceWidget = 0;
+            ourClicksAtLastRead = 0;
+            lastWidgetKey = '';
             iframeSeenAt = null;
+            iframeGoneSince = null;
+            widgetWaitStart = null;
             loggedWaitAuto = false;
+            lastJiggle = 0;
             retried += 1;
+            resetTried = false;
+        };
+
+        if (cfUrls.length && waitedOnWidget >= TURNSTILE_POST_CLICK_WAIT_S && !token && retried < 2) {
+            if (!resetTried) {
+                // 未受打扰的纯等待窗口：TURNSTILE_AUTO_WAIT_S + TURNSTILE_POST_CLICK_WAIT_S
+                // 都没出 token，才动一次 reset；期间每 15s 做点自然鼠标漂移。
+                resetTried = true;
+                log('⚠️ 纯等待窗口内未出 token，先 turnstile.reset() 让控件重新求解...');
+                await page.evaluate(() => {
+                    try {
+                        if (window.turnstile && typeof window.turnstile.reset === 'function') window.turnstile.reset();
+                    } catch (e) { /* ignore */ }
+                });
+                widgetWaitStart = i;
+                continue;
+            }
+            await reopenWidget('长时间无 token');
         } else if (!cfUrls.length && (i === 14 || i === 32) && retried < 2) {
-            log('⚠️ 未出现 Turnstile iframe，取消后重试点击 EXTEND SERVER...');
-            await page.evaluate(() => {
-                const cancel = Array.from(document.querySelectorAll('button')).find((el) =>
-                    (el.textContent || '').trim().toLowerCase() === 'cancel'
-                );
-                if (cancel) cancel.click();
-            });
-            await sleep(1200);
-            await clickRenew(page);
-            clicksOnThisWidget = 0;
-            iframeSeenAt = null;
-            loggedWaitAuto = false;
-            retried += 1;
+            await reopenWidget('未出现 Turnstile iframe');
         }
-        if (st.failedLoad && i > 12 && i % 15 === 0) {
+        // 控件出现过又消失：CF 已判定并撤下控件，傻等无意义，立即重开弹窗
+        if (iframeGoneSince != null && i - iframeGoneSince >= 8 && retried < 2) {
+            await reopenWidget('Turnstile 控件消失（验证被判失败）');
+        }
+        if (st.failedLoad && !cfUrls.length && i > 12 && i % 15 === 0) {
             log('⚠️ Turnstile 加载失败，重试点击 EXTEND SERVER...');
             await page.evaluate(() => {
                 const cancel = Array.from(document.querySelectorAll('button')).find((el) =>
@@ -1016,8 +1263,14 @@ async function waitTurnstileSolved(page, timeoutS = 75) {
             });
             await sleep(1500);
             await clickRenew(page);
-            clicksOnThisWidget = 0;
+            ourClicks = 0;
+            libClicksSinceWidget = 0;
+            ourClicksAtLastRead = 0;
+            lastWidgetKey = '';
             iframeSeenAt = null;
+            iframeGoneSince = null;
+            widgetWaitStart = null;
+            lastJiggle = 0;
             loggedWaitAuto = false;
         }
     }
@@ -1051,7 +1304,7 @@ async function renew(page) {
     await clickRenew(page);
     await humanWait(1, 2);
 
-    const result = await waitTurnstileSolved(page, 80);
+    const result = await waitTurnstileSolved(page, TURNSTILE_WAIT_S);
     if (result.ok) {
         log(`✅ 续期成功: ${result.text}`);
         await screenshot(page, 'renewal_ok.png');
@@ -1149,4 +1402,6 @@ module.exports = {
     turnstileAction,
     isClickInViewport,
     formatNotification,
+    buildChromeArgs,
+    turnstileWidgetKey,
 };
