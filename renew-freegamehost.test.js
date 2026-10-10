@@ -1,7 +1,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 process.env.SERVER_ID = 'testsrv1';
-const { parseSessionCookies, turnstileClickPoint, formatNotification, turnstileAction, isClickInViewport } = require('./renew-freegamehost');
+const { parseSessionCookies, turnstileClickPoint, formatNotification, turnstileAction, isClickInViewport, buildChromeArgs, turnstileWidgetKey } = require('./renew-freegamehost');
 
 test('parseSessionCookies parses cookie header string for puppeteer setCookie', () => {
     const cookies = parseSessionCookies('pterodactyl_session=abc%3D; XSRF-TOKEN=token; theme=dark');
@@ -126,4 +126,57 @@ test('error notification truncates long dumps', () => {
     }, clock);
     assert.match(msg, /⚠️ /);
     assert.ok(msg.length < 400);
+});
+
+test('buildChromeArgs keeps window/size real-browser geometry and avoids automation flags', () => {
+    const args = buildChromeArgs({ win: '1366x900' });
+    assert.ok(args.includes('--window-size=1366,900'));
+    assert.ok(args.includes('--disable-blink-features=AutomationControlled'));
+    // 无 GPU 环境必须保留软件渲染，否则 WebGL 不可用
+    assert.ok(args.includes('--enable-unsafe-swiftshader'));
+    // 新 profile 首启向导会盖住站点
+    assert.ok(args.includes('--no-first-run'));
+    assert.ok(args.includes('--no-default-browser-check'));
+});
+
+test('buildChromeArgs clamps a malformed window size to the default', () => {
+    const args = buildChromeArgs({ win: 'garbage' });
+    assert.ok(args.includes('--window-size=1366,900'));
+});
+
+test('buildChromeArgs disables non-proxied WebRTC UDP only when proxied', () => {
+    const direct = buildChromeArgs({});
+    assert.ok(!direct.some((a) => a.startsWith('--proxy-server')));
+    assert.ok(!direct.includes('--force-webrtc-ip-handling-policy=disable_non_proxied_udp'));
+
+    const proxied = buildChromeArgs({ proxy: 'socks5://127.0.0.1:1080' });
+    assert.ok(proxied.includes('--proxy-server=socks5://127.0.0.1:1080'));
+    // 否则 WebRTC 会泄露 runner 真实 IP，与代理出口 IP 不一致
+    assert.ok(proxied.includes('--force-webrtc-ip-handling-policy=disable_non_proxied_udp'));
+});
+
+test('turnstileWidgetKey treats a re-rendered widget as a new instance', () => {
+    const a = turnstileWidgetKey('https://challenges.cloudflare.com/cdn-cgi/challenge-platform/h/b/turnstile/f/ov2/av0/rch/abc123/new/compact');
+    const b = turnstileWidgetKey('https://challenges.cloudflare.com/cdn-cgi/challenge-platform/h/b/turnstile/f/ov2/av0/rch/xyz789/new/compact');
+    assert.notEqual(a, b, '不同 rch 段的控件必须视为不同实例，否则计时不会重置');
+    assert.equal(turnstileWidgetKey(''), '');
+    assert.equal(turnstileWidgetKey('not a url'), 'not a url');
+});
+
+test('turnstileAction clicks at most once per widget after the auto window', () => {
+    // TURNSTILE_NO_CLICK 在 require 时读取，此处为未设置状态
+    assert.equal(
+        turnstileAction({ hasToken: false, hasIframe: true, iframeAgeS: 999, clicksOnThisWidget: 0 }),
+        'click'
+    );
+    // 已经点过一次就不再补刀，把剩下的时间全部留给 CF
+    assert.equal(
+        turnstileAction({ hasToken: false, hasIframe: true, iframeAgeS: 999, clicksOnThisWidget: 1 }),
+        'wait'
+    );
+    // 内置求解器点过也算数（双重打断的根因）
+    assert.equal(
+        turnstileAction({ hasToken: false, hasIframe: true, iframeAgeS: 999, clicksOnThisWidget: 2 }),
+        'wait'
+    );
 });
