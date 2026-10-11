@@ -25,7 +25,7 @@
  *   TURNSTILE_WAIT_S             整体预算，默认 300
  *   TURNSTILE_NO_CLICK=true      全程不主动点击控件（纯等 CF 自己过）
  *   TURNSTILE_LIB_SOLVER=true    启用 puppeteer-real-browser 内置点击器（默认关，它会每秒戳控件）
- *   BROWSER_TZ                   浏览器时区，如 Asia/Shanghai（对齐代理出口）
+ *   BROWSER_TZ                   浏览器时区，应与代理出口地区一致，如 America/Los_Angeles
  *   BROWSER_WINDOW               浏览器窗口，如 1366x900；须小于 Xvfb 屏幕
  */
 
@@ -52,8 +52,27 @@ const LOGIN_URL = `${BASE_URL}/auth/login`;
 const ARTIFACTS_DIR = path.join(__dirname, 'artifacts');
 
 function log(msg) {
-    const t = new Date().toTimeString().slice(0, 8);
-    console.log(`[${t}] [INFO] ${msg}`);
+    console.log(`[${nowClock()}] [INFO] ${msg}`);
+}
+
+// 日志时间戳固定使用 LOG_TZ（默认北京时间），不跟随 BROWSER_TZ。
+// 否则改浏览器时区会连带把日志时区改掉，看历史日志还得重新换算。
+// 用 formatToParts 而非 toTimeString，避免受进程 TZ / 系统区域设置影响。
+const LOG_TZ = (process.env.LOG_TZ || 'Asia/Shanghai').trim();
+function nowClock(date = new Date()) {
+    try {
+        const p = new Intl.DateTimeFormat('en-GB', {
+            timeZone: LOG_TZ,
+            hour: '2-digit',
+            minute: '2-digit',
+            second: '2-digit',
+            hour12: false,
+        }).formatToParts(date);
+        const get = (t) => (p.find((x) => x.type === t) || {}).value || '00';
+        return `${get('hour')}:${get('minute')}:${get('second')}`;
+    } catch (e) {
+        return date.toTimeString().slice(0, 8);
+    }
 }
 
 function sleep(ms) {
@@ -258,9 +277,6 @@ function buildChromeArgs({ proxy = '', win = BROWSER_WINDOW, extra = [] } = {}) 
 }
 
 async function launchRealBrowser() {
-    // 时区与代理出口对齐（GH runner 默认 UTC，和亚洲节点+中文账号组合明显不符）
-    if (process.env.BROWSER_TZ) process.env.TZ = process.env.BROWSER_TZ;
-
     const args = buildChromeArgs({ proxy: IS_PROXY ? PROXY_SERVER : '' });
 
     const chromePath = fs.existsSync('/usr/bin/google-chrome')
@@ -274,7 +290,17 @@ async function launchRealBrowser() {
     // 补丁是无条件生效的。所以默认关闭它，避免它每秒戳一次控件打断 CF 求解。
     const libSolver = (process.env.TURNSTILE_LIB_SOLVER || 'false').toLowerCase() === 'true';
 
-    log(`🚀 启动浏览器（puppeteer-real-browser / libSolver=${libSolver}）`);
+    // 时区只传给 Chrome，不设 process.env.TZ —— 后者是全局的，会连带改掉
+    // 脚本自身日志的时间戳。chrome-launcher 支持 envVars，这里用它做进程级隔离。
+    const browserTz = (process.env.BROWSER_TZ || '').trim();
+    const customConfig = {};
+    if (chromePath) customConfig.chromePath = chromePath;
+    if (browserTz) {
+        // 仅覆盖给子进程的 TZ，其余环境变量照常继承
+        customConfig.envVars = { ...process.env, TZ: browserTz };
+    }
+
+    log(`🚀 启动浏览器（puppeteer-real-browser / libSolver=${libSolver}${browserTz ? ` / TZ=${browserTz}` : ''}）`);
     let browser;
     let page;
     try {
@@ -283,7 +309,7 @@ async function launchRealBrowser() {
             turnstile: libSolver,
             disableXvfb: true,
             ignoreAllFlags: true,
-            customConfig: chromePath ? { chromePath } : {},
+            customConfig,
             connectOption: {
                 // 不强制 viewport：让视口等于真实窗口内容区，避免造出 innerWidth>screen.width
                 defaultViewport: null,
@@ -293,13 +319,17 @@ async function launchRealBrowser() {
     } catch (e) {
         throw new Error(`浏览器启动失败: ${e.message}`);
     }
-    await logFingerprint(page);
+    // 这里不测指纹：此刻页面还是 about:blank，测出来的 mem/uaData/chrome 不可信。
     // 网络诊断 + 点击计数埋点在启动时就注入，保证复用 cookie 直接进服务器页时也生效
     await attachLoginDiagnostics(page);
     return { browser, page };
 }
 
-async function logFingerprint(page) {
+// 指纹探针。必须在「真实 https 页面」上调用：
+//   navigator.deviceMemory / userAgentData 等 API 只在安全上下文可用，
+//   在 about:blank（启动瞬间）测出来的 undefined/absent 没有参考价值。
+// 所以 launchRealBrowser 不再调用它，改为在导航到真实站点后调用（见 main）。
+async function logFingerprint(page, tag = '') {
     try {
         const fp = await page.evaluate(() => {
             // 必须读页面上已存在/复用的 canvas，而不是新建一个——新建的恒为 software，
@@ -330,6 +360,8 @@ async function logFingerprint(page) {
             let chromeObj = 'n/a';
             try { chromeObj = window.chrome && window.chrome.runtime ? 'runtime' : (window.chrome ? 'no-runtime' : 'absent'); } catch (e) { /* */ }
             return {
+                origin: location.origin,
+                secure: window.isSecureContext,
                 webdriver: navigator.webdriver,
                 platform: navigator.platform,
                 lang: navigator.language,
@@ -349,8 +381,9 @@ async function logFingerprint(page) {
                 plugins: navigator.plugins.length,
             };
         });
-        log(`🧬 指纹: webdriver=${fp.webdriver} platform=${fp.platform} lang=${fp.lang} langs=[${fp.langs}] cores=${fp.cores} mem=${fp.mem} tz=${fp.tz} uaData=${fp.uaData} chrome=${fp.chromeObj}`);
-        log(`🧬 指纹: screen=${fp.screen} avail=${fp.avail} inner=${fp.inner} dpr=${fp.dpr} maxTouch=${fp.maxTouch} plugins=${fp.plugins} webgl="${fp.webgl}" maxTex=${fp.noise}`);
+        const t = tag ? `${tag} ` : '';
+        log(`🧬 指纹${t}(${fp.origin} secure=${fp.secure}): webdriver=${fp.webdriver} platform=${fp.platform} lang=${fp.lang} langs=[${fp.langs}] cores=${fp.cores} mem=${fp.mem} tz=${fp.tz} uaData=${fp.uaData} chrome=${fp.chromeObj}`);
+        log(`🧬 指纹${t}: screen=${fp.screen} avail=${fp.avail} inner=${fp.inner} dpr=${fp.dpr} maxTouch=${fp.maxTouch} plugins=${fp.plugins} webgl="${fp.webgl}" maxTex=${fp.noise}`);
         // 真实浏览器里 innerWidth/Height <= screen.width/height 恒成立（有浏览器 chrome 会更小）。
         // 一旦大于，就是 headless / 视口被强设的特征；若窗口也等于屏幕，说明是无边框的 Xvfb 全屏。
         try {
@@ -363,6 +396,10 @@ async function logFingerprint(page) {
                 log(`⚠️ 几何可疑: 视口与屏幕完全相等（${fp.screen}），通常是无边框 Xvfb 全屏；真机应略小于屏幕`);
             }
         } catch (e) { /* ignore */ }
+        // 这几项在非安全上下文（about:blank / http）本来就是空的，此时读数无参考价值
+        if (!fp.secure) {
+            log(`ℹ️ 指纹${t}在非安全上下文测得，mem/uaData/chrome 可能为空，仅供参考`);
+        }
     } catch (e) { /* ignore */ }
 }
 
@@ -1339,6 +1376,8 @@ async function main() {
         await page.goto('https://api.ip.sb/ip', { waitUntil: 'domcontentloaded', timeout: 20000 });
         egressIp = await page.evaluate(() => (document.body.innerText || '').trim()).catch(() => '');
         log(`📍 当前出口IP: ${maskIp(egressIp)}`);
+        // 已在真实 https 页面上，此时指纹读数才有意义
+        await logFingerprint(page, '(站点页)');
     } catch (e) {
         log(`⚠️ 获取出口 IP 失败: ${e.message}`);
     }
