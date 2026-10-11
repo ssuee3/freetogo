@@ -1,7 +1,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 process.env.SERVER_ID = 'testsrv1';
-const { parseSessionCookies, turnstileClickPoint, formatNotification, turnstileAction, isClickInViewport, buildChromeArgs, turnstileWidgetKey } = require('./renew-freegamehost');
+const { parseSessionCookies, turnstileClickPoint, formatNotification, turnstileAction, isClickInViewport, buildChromeArgs, turnstileWidgetKey, isRenewButtonText, pickRenewButton } = require('./renew-freegamehost');
 
 test('parseSessionCookies parses cookie header string for puppeteer setCookie', () => {
     const cookies = parseSessionCookies('pterodactyl_session=abc%3D; XSRF-TOKEN=token; theme=dark');
@@ -180,3 +180,57 @@ test('turnstileAction clicks at most once per widget after the auto window', () 
         'wait'
     );
 });
+
+// ---- 续期按钮文案匹配（站点改版：EXTEND SERVER → EXTEND FREE SERVER）----
+
+test('isRenewButtonText matches both the old and the new button label', () => {
+    // 旧版
+    assert.equal(isRenewButtonText('EXTEND SERVER +8 HOURS'), true);
+    assert.equal(isRenewButtonText('RENEW +8 HOURS'), true);
+    // 新版：中间插入 FREE，且 +8 HOURS 可能是独立徽章（不在按钮文本内）
+    assert.equal(isRenewButtonText('⚡ EXTEND FREE SERVER +8 HOURS'), true);
+    assert.equal(isRenewButtonText('EXTEND FREE SERVER'), true);
+    assert.equal(isRenewButtonText('  extend   free   server  '), true, '应容忍多余空白与大小写');
+});
+
+test('isRenewButtonText rejects lookalike text on the same page', () => {
+    // 截图底部 "No Renewal Timers" —— RENEWAL 不等于 RENEW，不能被 \b 之外的写法误命中
+    assert.equal(isRenewButtonText('No Renewal Timers'), false);
+    // 顶部 "Go Premium" 区块
+    assert.equal(isRenewButtonText('GO PREMIUM'), false);
+    assert.equal(isRenewButtonText('UPGRADE'), false);
+    // 底部说明文字含 "8 hours" 但无动作词
+    assert.equal(isRenewButtonText('Adds 8 hours to your countdown • 2-hour cooldown'), false);
+    // 说明文字含 "renew" 但无 SERVER / 8 HOURS
+    assert.equal(isRenewButtonText('Complete security check to renew'), false);
+    assert.equal(isRenewButtonText(''), false);
+    assert.equal(isRenewButtonText(null), false);
+});
+
+test('pickRenewButton prefers the real button over the page heading', () => {
+    // 复刻截图：左上角是标题 "EXTEND SERVER"，下方才是真按钮（带 +8 HOURS 徽章）
+    const buttons = [
+        { i: 0, text: 'EXTEND SERVER', tag: 'DIV', visible: true, disabled: false },
+        { i: 1, text: '⚡ EXTEND FREE SERVER +8 HOURS', tag: 'BUTTON', visible: true, disabled: false },
+        { i: 2, text: 'No Renewal Timers', tag: 'BUTTON', visible: true, disabled: false },
+    ];
+    const picked = pickRenewButton(buttons);
+    assert.equal(picked.i, 1, '必须选中带 +8 HOURS 的真按钮，而不是左上角标题');
+});
+
+test('pickRenewButton still works when the badge is outside the button text', () => {
+    // 新版可能把 +8 HOURS 渲染成按钮外的独立徽章
+    const buttons = [
+        { i: 0, text: 'EXTEND SERVER', tag: 'DIV', visible: true, disabled: false },
+        { i: 1, text: '⚡ EXTEND FREE SERVER', tag: 'BUTTON', visible: true, disabled: false },
+    ];
+    const picked = pickRenewButton(buttons);
+    assert.equal(picked.i, 1, '应选中真正的 <button>，而非标题 DIV');
+});
+
+test('pickRenewButton returns null when the button is absent (cooldown)', () => {
+    assert.equal(pickRenewButton([{ i: 0, text: 'GO PREMIUM', tag: 'BUTTON', visible: true }]), null);
+    assert.equal(pickRenewButton([]), null);
+    assert.equal(pickRenewButton(null), null);
+});
+
