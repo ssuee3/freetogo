@@ -6,7 +6,7 @@
  * 拿到 token 会自动 POST /api/client/freeservers/{uuid}/renew，脚本只等成功/失败 UI。
  *
  * 流程：启动过盾浏览器 → 打开登录页 → 关 cookie 弹窗 → 填凭证 → 点 LOGIN
- *   → 等离开 /auth/login → 打开服务器页 → 读剩余时间/冷却 → 点 RENEW +8 HOURS
+ *   → 等离开 /auth/login → 打开服务器页 → 读剩余时间/冷却 → 点续期按钮（EXTEND [FREE] SERVER）
  *   → 等 Turnstile 自动求解并提交 → 检查成功提示或剩余时间增加 → TG 通知 + 截图。
  *
  * 环境变量：
@@ -1058,8 +1058,57 @@ async function login(page) {
     throw new Error(`登录超时未离开登录页 | ${JSON.stringify(diag)}`);
 }
 
+// 续期按钮文案会随站点 UI 改版而变，故不写死整句，改用「动作词 + 续期语义」两段式判断：
+//   旧版：EXTEND SERVER +8 HOURS
+//   新版：⚡ EXTEND FREE SERVER  +8 HOURS（+8 HOURS 是独立徽章，可能不在按钮文本内）
+// 两个约束缺一不可：
+//   1) 必须有独立的动作词（\b 词边界，避免误命中 "No Renewal Timers" —— RENEWAL ≠ RENEW）
+//   2) 必须有续期语义（SERVER / 8 HOURS），避免命中 "Complete security check to renew" 之类说明文字
+const RENEW_BTN_SELECTOR = 'button, [role="button"]';
+
+function isRenewButtonText(text) {
+    const t = String(text || '').replace(/\s+/g, ' ').trim().toUpperCase();
+    if (!t) return false;
+    if (!/\b(EXTEND|RENEW)\b/.test(t)) return false;
+    return /\bSERVER\b/.test(t) || /\b8\s*HOURS?\b/.test(t) || /\+\s*8\b/.test(t);
+}
+
+// 多个候选时择优：真正的续期按钮带 +8 HOURS 徽章，其次是可见、可点、真 <button>。
+// 页面左上角还有一个 "EXTEND SERVER" 标题，靠 +8 HOURS 这一项把它排下去。
+function pickRenewButton(buttons = []) {
+    const score = (b) => {
+        let s = 0;
+        if (/8\s*HOURS?|\+\s*8/.test(String(b.text || '').toUpperCase())) s += 8;
+        if (b.visible) s += 4;
+        if (!b.disabled) s += 2;
+        if (String(b.tag || '').toUpperCase() === 'BUTTON') s += 1;
+        return s;
+    };
+    const matches = (buttons || []).filter((b) => b && isRenewButtonText(b.text));
+    if (!matches.length) return null;
+    return matches.slice().sort((a, b) => score(b) - score(a))[0];
+}
+
+// 取出页面上所有按钮的原始数据；判断逻辑放在 Node 侧（见上），避免两处正则各写一份而漂移
+async function readButtons(page) {
+    try {
+        return await page.evaluate((sel) => Array.from(document.querySelectorAll(sel)).map((el, i) => {
+            const r = el.getBoundingClientRect();
+            return {
+                i,
+                text: (el.textContent || '').replace(/\s+/g, ' ').trim(),
+                disabled: !!el.disabled,
+                tag: el.tagName,
+                visible: r.width > 0 && r.height > 0,
+            };
+        }), RENEW_BTN_SELECTOR);
+    } catch (e) {
+        return [];
+    }
+}
+
 async function readRenewState(page) {
-    return await page.evaluate(() => {
+    const st = await page.evaluate(() => {
         const body = document.body ? document.body.innerText : '';
         const remain = (body.match(/TIME REMAINING[\s\S]{0,40}?(\d{1,2}:\d{2}:\d{2})/i) || [])[1]
             || (body.match(/(\d{2}:\d{2}:\d{2})\s*HH\s*:\s*MM\s*:\s*SS/i) || [])[1]
@@ -1069,14 +1118,15 @@ async function readRenewState(page) {
         const success = /server renewed successfully/i.test(body);
         const failedLoad = /failed to load\. try again/i.test(body);
         const security = /complete security check to renew/i.test(body);
-        const renewBtn = Array.from(document.querySelectorAll('button')).some((el) =>
-            /(?:EXTEND\s*SERVER|RENEW)\s*\+\s*8\s*HOURS/i.test((el.textContent || '').replace(/\s+/g, ' '))
-        );
         const flash = Array.from(document.querySelectorAll('[role="alert"], .alert, .Toastify')).map((el) =>
             (el.textContent || '').trim().replace(/\s+/g, ' ')
         ).filter(Boolean)[0] || '';
-        return { remain, cooldown, cooldownTime, success, failedLoad, security, renewBtn, flash, url: location.href };
+        return { remain, cooldown, cooldownTime, success, failedLoad, security, flash, url: location.href };
     });
+    const cand = pickRenewButton(await readButtons(page));
+    st.renewBtn = !!cand;
+    st.renewBtnText = cand ? cand.text : '';
+    return st;
 }
 
 async function openServer(page) {
@@ -1097,17 +1147,26 @@ async function openServer(page) {
 }
 
 async function clickRenew(page) {
-    log('🖱️ 点击 EXTEND SERVER +8 HOURS...');
-    const ok = await page.evaluate(() => {
-        const btns = Array.from(document.querySelectorAll('button'));
-        const b = btns.find((el) => /(?:EXTEND\s*SERVER|RENEW)\s*\+\s*8\s*HOURS/i.test((el.textContent || '').replace(/\s+/g, ' ')));
-        if (!b || b.disabled) return false;
-        b.click();
+    const cand = pickRenewButton(await readButtons(page));
+    if (!cand) {
+        await screenshot(page, 'no_renew_button.png');
+        throw new Error('未找到续期按钮（EXTEND [FREE] SERVER +8 HOURS），可能仍在冷却中');
+    }
+    log(`🖱️ 点击续期按钮: ${cand.text.slice(0, 60)}`);
+    // 优先按文本精确定位，索引仅作兜底：React SPA 可能在两次调用之间重渲染导致索引位移
+    const ok = await page.evaluate((target) => {
+        const btns = Array.from(document.querySelectorAll('button, [role="button"]'));
+        const norm = (el) => (el.textContent || '').replace(/\s+/g, ' ').trim();
+        let el = btns.find((b) => norm(b) === target.text);
+        if (!el) el = btns.find((b, i) => i === target.i && norm(b) === target.text);
+        if (!el) el = btns[target.i];
+        if (!el || el.disabled) return false;
+        el.click();
         return true;
-    });
+    }, { i: cand.i, text: cand.text });
     if (!ok) {
         await screenshot(page, 'no_renew_button.png');
-        throw new Error('未找到可点击的 EXTEND SERVER +8 HOURS 按钮（可能在冷却中）');
+        throw new Error(`续期按钮不可点击（disabled）: ${cand.text.slice(0, 60)}`);
     }
 }
 
@@ -1291,7 +1350,7 @@ async function waitTurnstileSolved(page, timeoutS = 75) {
             await reopenWidget('Turnstile 控件消失（验证被判失败）');
         }
         if (st.failedLoad && !cfUrls.length && i > 12 && i % 15 === 0) {
-            log('⚠️ Turnstile 加载失败，重试点击 EXTEND SERVER...');
+            log('⚠️ Turnstile 加载失败，重试点击续期按钮...');
             await page.evaluate(() => {
                 const cancel = Array.from(document.querySelectorAll('button')).find((el) =>
                     (el.textContent || '').trim().toLowerCase() === 'cancel'
@@ -1335,7 +1394,7 @@ async function renew(page) {
 
     if (!before.renewBtn) {
         await screenshot(page, 'no_renew_button.png');
-        throw new Error('页面上没有 EXTEND SERVER +8 HOURS 按钮');
+        throw new Error('页面上没有续期按钮（EXTEND [FREE] SERVER +8 HOURS）');
     }
 
     await clickRenew(page);
@@ -1443,4 +1502,6 @@ module.exports = {
     formatNotification,
     buildChromeArgs,
     turnstileWidgetKey,
+    isRenewButtonText,
+    pickRenewButton,
 };
